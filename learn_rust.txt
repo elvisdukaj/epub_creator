@@ -1,0 +1,12 @@
+https://blog.sheerluck.dev/posts/learn-rust-basics-by-building-a-interpreter-brainfuck/
+https://blog.sheerluck.dev/posts/learn-rust-ownership-by-building-mini-grep/
+https://blog.sheerluck.dev/posts/learn-rust-structs-enums-pattern-matching-by-building-a-json-parser/
+https://blog.sheerluck.dev/posts/learn-error-hanlding-in-rust/
+https://blog.sheerluck.dev/posts/learn-generics-traits-in-rust-by-building-blackjack-card-game-engine/
+https://blog.sheerluck.dev/posts/learn-rust-lifetimes-by-building-a-lru-cache/
+https://blog.sheerluck.dev/posts/learn-hashmap-iterators-by-building-a-git-object-store-reader/
+https://blog.sheerluck.dev/posts/learn-rust-closures-by-building-a-tiny-linter/
+https://blog.sheerluck.dev/posts/learn-rust-smart-pointers-and-interior-mutability-by-building-git-commit-graph-viewer/
+https://blog.sheerluck.dev/posts/learn-rust-concurrency-by-building-a-thread-pool/
+https://blog.sheerluck.dev/posts/learn-rust-async-await-by-building-an-http-server/
+https://blog.sheerluck.dev/posts/learn-sql-and-sqlx-by-building-a-book-library-cli-in-rust/

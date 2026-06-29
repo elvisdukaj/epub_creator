@@ -1,0 +1,3 @@
+https://blog.sheerluck.dev/posts/learn-bevy-states-timers-by-building-snake/
+https://blog.sheerluck.dev/posts/build-breakout-in-bevy-step-by-step/
+https://blog.sheerluck.dev/posts/learn-the-basics-of-bevy-by-building-and-deploying-pong-to-itch-io/
