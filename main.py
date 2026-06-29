@@ -4,10 +4,11 @@ Create an EPUB from a list of web links using Pandoc or Calibre.
 
 Features:
 - Accepts links from a text file or command-line arguments
-- Downloads each page
+- Downloads each page with progress feedback
 - Extracts the main readable content when possible
 - Bundles pages into a single EPUB with a table of contents
 - Can use Pandoc (default) or Calibre's ebook-convert
+- Rich terminal output with colors, progress bars, and status
 
 Examples:
   python3 create_epub_from_links.py \
@@ -21,7 +22,7 @@ Examples:
       https://example.com/page1 https://example.com/page2
 
 Requirements:
-- Python packages: requests, beautifulsoup4
+- Python packages: requests, beautifulsoup4, rich
 - External tools: pandoc and/or ebook-convert
 """
 
@@ -35,13 +36,21 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import List, Tuple
 from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
+from rich.table import Table
+from rich.text import Text
+from rich import box
 
+console = Console()
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
@@ -232,6 +241,72 @@ def build_calibre_epub(chapter_files: List[Path], output_epub: Path, title: str,
     subprocess.run(cmd, check=True)
 
 
+def print_banner(title: str, engine: str, num_links: int) -> None:
+    banner = Table(box=box.ROUNDED, show_header=False, border_style="cyan")
+    banner.add_column(justify="left")
+    banner.add_row(f"[bold cyan]EPUB Builder[/bold cyan]")
+    banner.add_row(f"")
+    banner.add_row(f"[bold]Title:[/bold]   {title}")
+    banner.add_row(f"[bold]Engine:[/bold]  {engine}")
+    banner.add_row(f"[bold]Links:[/bold]   {num_links}")
+    console.print(banner)
+    console.print()
+
+
+def print_summary(results: List[dict], output_epub: Path, elapsed: float) -> None:
+    console.print()
+
+    # Results table
+    table = Table(title="Chapter Summary", box=box.SIMPLE_HEAVY, border_style="blue")
+    table.add_column("#", style="dim", width=4)
+    table.add_column("Status", width=8)
+    table.add_column("Title", max_width=50)
+    table.add_column("URL", max_width=60, style="dim")
+
+    for r in results:
+        if r["status"] == "ok":
+            status = "[green]OK[/green]"
+        else:
+            status = "[red]FAIL[/red]"
+        table.add_row(
+            str(r["idx"]),
+            status,
+            r.get("title", "—"),
+            r["url"][:60],
+        )
+
+    console.print(table)
+    console.print()
+
+    success_count = sum(1 for r in results if r["status"] == "ok")
+    fail_count = sum(1 for r in results if r["status"] == "fail")
+
+    # Final status
+    if output_epub.exists():
+        size_kb = output_epub.stat().st_size / 1024
+        if size_kb > 1024:
+            size_str = f"{size_kb / 1024:.1f} MB"
+        else:
+            size_str = f"{size_kb:.0f} KB"
+
+        console.print(Panel(
+            f"[bold green]EPUB created successfully![/bold green]\n\n"
+            f"  [bold]File:[/bold]     {output_epub}\n"
+            f"  [bold]Size:[/bold]     {size_str}\n"
+            f"  [bold]Chapters:[/bold] {success_count} ok, {fail_count} failed\n"
+            f"  [bold]Time:[/bold]     {elapsed:.1f}s",
+            title="Done",
+            border_style="green",
+        ))
+    else:
+        console.print(Panel(
+            f"[bold red]EPUB creation failed.[/bold red]\n\n"
+            f"  Chapters processed: {success_count} ok, {fail_count} failed",
+            title="Error",
+            border_style="red",
+        ))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create an EPUB from a list of links.")
     parser.add_argument("links", nargs="*", help="URLs to include in the EPUB")
@@ -244,54 +319,88 @@ def main() -> int:
     parser.add_argument("--keep-temp", action="store_true", help="Keep temporary files for debugging")
     args = parser.parse_args()
 
+    # --- Validate links ---
     try:
         links = read_links(args.links, args.input)
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        console.print(f"[bold red]Error:[/bold red] {e}")
         return 2
 
-    output_epub = Path(args.output).resolve()
+    # --- Check engine availability ---
+    if args.engine == "pandoc" and not shutil.which("pandoc"):
+        console.print("[bold red]Error:[/bold red] pandoc not found in PATH. Install it or use --engine calibre.")
+        return 2
+    if args.engine == "calibre" and not shutil.which("ebook-convert"):
+        console.print("[bold red]Error:[/bold red] ebook-convert not found in PATH. Install Calibre or use --engine pandoc.")
+        return 2
 
+    # --- Banner ---
+    print_banner(args.title, args.engine, len(links))
+
+    output_epub = Path(args.output).resolve()
     tmp_ctx = tempfile.TemporaryDirectory(prefix="epub_links_")
     workdir = Path(tmp_ctx.name)
+    start_time = time.time()
 
     try:
         chapter_files = []
-        for idx, url in enumerate(links, start=1):
-            print(f"Fetching {idx}/{len(links)}: {url}", file=sys.stderr)
-            try:
-                raw_html = fetch_html(url)
-                chapter_title, body_html = extract_main_content(raw_html, url)
-                chapter_name = f"{idx:03d}-{slugify(chapter_title)}.xhtml"
-                chapter_path = workdir / chapter_name
-                chapter_path.write_text(
-                    make_xhtml(chapter_title, body_html, url),
-                    encoding="utf-8",
-                )
-                chapter_files.append(chapter_path)
-            except Exception as e:
-                print(f"Warning: failed to process {url}: {e}", file=sys.stderr)
+        results = []
+
+        with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(bar_width=30),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                console=console,
+        ) as progress:
+            task = progress.add_task("Downloading & extracting...", total=len(links))
+
+            for idx, url in enumerate(links, start=1):
+                progress.update(task, description=f"[cyan]{idx}/{len(links)}[/cyan] {urlparse(url).netloc}")
+                try:
+                    raw_html = fetch_html(url)
+                    chapter_title, body_html = extract_main_content(raw_html, url)
+                    chapter_name = f"{idx:03d}-{slugify(chapter_title)}.xhtml"
+                    chapter_path = workdir / chapter_name
+                    chapter_path.write_text(
+                        make_xhtml(chapter_title, body_html, url),
+                        encoding="utf-8",
+                    )
+                    chapter_files.append(chapter_path)
+                    results.append({"idx": idx, "url": url, "status": "ok", "title": chapter_title})
+                    progress.console.print(f"  [green]\u2713[/green] {chapter_title}")
+                except Exception as e:
+                    results.append({"idx": idx, "url": url, "status": "fail", "title": str(e)})
+                    progress.console.print(f"  [red]\u2717[/red] {url} \u2014 {e}")
+
+                progress.advance(task)
 
         if not chapter_files:
-            raise RuntimeError("No chapters were successfully created.")
+            console.print("[bold red]Error:[/bold red] No chapters were successfully created. Nothing to build.")
+            print_summary(results, output_epub, time.time() - start_time)
+            return 1
 
-        output_epub.parent.mkdir(parents=True, exist_ok=True)
+        # --- Build EPUB ---
+        console.print()
+        with console.status(f"[bold blue]Building EPUB with {args.engine}...[/bold blue]", spinner="dots"):
+            output_epub.parent.mkdir(parents=True, exist_ok=True)
+            if args.engine == "pandoc":
+                build_pandoc_epub(chapter_files, output_epub, args.title, args.author, args.language)
+            else:
+                build_calibre_epub(chapter_files, output_epub, args.title, args.author, args.language, workdir)
 
-        if args.engine == "pandoc":
-            build_pandoc_epub(chapter_files, output_epub, args.title, args.author, args.language)
-        else:
-            build_calibre_epub(chapter_files, output_epub, args.title, args.author, args.language, workdir)
-
-        print(f"EPUB created: {output_epub}")
+        elapsed = time.time() - start_time
+        print_summary(results, output_epub, elapsed)
         return 0
 
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        console.print(f"\n[bold red]Fatal error:[/bold red] {e}")
         return 1
 
     finally:
         if args.keep_temp:
-            print(f"Temporary files kept at: {workdir}", file=sys.stderr)
+            console.print(f"[dim]Temporary files kept at: {workdir}[/dim]")
             tmp_ctx.cleanup = lambda: None
         else:
             tmp_ctx.cleanup()
