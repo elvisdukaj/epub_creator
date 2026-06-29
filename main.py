@@ -97,12 +97,22 @@ def fetch_html(url: str, timeout: int = 30) -> str:
     return resp.text
 
 
+def clean_title(title: str) -> str:
+    # Strip a trailing " | Site Name" / " – Site Name" suffix that pages put in
+    # <title> and og:title. Only split on a separator surrounded by spaces so we
+    # don't damage titles that legitimately contain a hyphen.
+    parts = re.split(r"\s+[|–—]\s+", title)
+    return parts[0].strip() or title.strip()
+
+
 def extract_title(soup: BeautifulSoup, url: str) -> str:
+    # Prefer the in-page <h1> (usually clean) before falling back to the
+    # <title>/og:title tags, which often carry a " | Site Name" suffix.
     for selector in [
+        "h1",
         "meta[property='og:title']",
         "meta[name='twitter:title']",
         "title",
-        "h1",
     ]:
         tag = soup.select_one(selector)
         if not tag:
@@ -110,11 +120,11 @@ def extract_title(soup: BeautifulSoup, url: str) -> str:
         if tag.name == "meta":
             content = tag.get("content", "").strip()
             if content:
-                return content
+                return clean_title(content)
         else:
             text = tag.get_text(" ", strip=True)
             if text:
-                return text
+                return clean_title(text)
 
     parsed = urlparse(url)
     return parsed.path.strip("/") or parsed.netloc or url
@@ -140,6 +150,42 @@ def score_candidate(tag) -> int:
     return score
 
 
+def looks_like_toc(tag, source_host: str | None = None) -> bool:
+    """Detect if an element is an in-page table of contents / navigation list."""
+    classes = " ".join(tag.get("class", [])).lower()
+    tag_id = (tag.get("id") or "").lower()
+    combined = classes + " " + tag_id
+
+    toc_keywords = ["toc", "table-of-contents", "tableofcontents", "page-nav",
+                    "article-nav", "contents", "jump-to", "on-this-page",
+                    "in-this-article", "sidebar-nav"]
+    for kw in toc_keywords:
+        if kw in combined:
+            return True
+
+    if tag.name in ("ul", "ol", "nav", "div"):
+        links = tag.find_all("a", href=True)
+        if len(links) >= 3:
+            # A list of links where most hrefs are anchors (#...) is likely a TOC
+            anchor_links = [a for a in links if a["href"].startswith("#")]
+            if len(anchor_links) / len(links) > 0.6:
+                return True
+            # Series / "read this series in order" navigation: a list whose links
+            # mostly point back to other pages on the same site. This block is
+            # injected into every post and is what made the EPUB TOC link out to
+            # the original blog instead of the bundled chapters. Restricted to
+            # real list/nav elements so we never swallow a content wrapper <div>.
+            if source_host and tag.name in ("ul", "ol", "nav"):
+                same_site = [
+                    a for a in links
+                    if urlparse(a["href"]).netloc.lower().endswith(source_host)
+                ]
+                if len(same_site) / len(links) > 0.6:
+                    return True
+
+    return False
+
+
 def extract_main_content(html_text: str, url: str) -> Tuple[str, str]:
     soup = BeautifulSoup(html_text, "html.parser")
     title = extract_title(soup, url)
@@ -160,8 +206,48 @@ def extract_main_content(html_text: str, url: str) -> Tuple[str, str]:
     else:
         best = soup.body or soup
 
-    for bad in best.select("nav, footer, header, aside, .sidebar, .comments, .comment, .share, .social"):
+    # Remove navigation, sidebars, footers, and per-post chrome (tag lists,
+    # prev/next pagination, post metadata) that link out to the original blog.
+    for bad in best.select(
+        "nav, footer, header, aside, .sidebar, .comments, .comment, .share, .social, "
+        ".pagination, .post-tags, .post-tags-inline, .post-meta, .post-nav, .post-date"
+    ):
         bad.decompose()
+
+    # Remove in-page TOC / series-navigation sections from the source HTML.
+    # These duplicate what Pandoc's --toc regenerates from the chapter headings,
+    # and (for this blog) link out to the original posts.
+    source_host = urlparse(url).netloc.lower()
+    for tag in best.find_all(["ul", "ol", "nav", "div", "section", "aside"]):
+        if tag.attrs is None:  # already detached when an ancestor was removed
+            continue
+        if looks_like_toc(tag, source_host):
+            tag.decompose()
+
+    # Drop the "Read this series in order:" style intro paragraph that precedes
+    # the series list. It's a short paragraph whose only links point back to the
+    # same site (e.g. a /series/ or /tags/ page), i.e. blog chrome, not content.
+    for p in best.find_all("p"):
+        links = p.find_all("a", href=True)
+        if not links:
+            continue
+        same_site = [a for a in links if urlparse(a["href"]).netloc.lower().endswith(source_host)]
+        if len(same_site) == len(links) and len(p.get_text(strip=True)) < 120:
+            p.decompose()
+
+    # Drop the article's own top-level heading(s). make_xhtml() already emits one
+    # <h1> per chapter (the title). Keeping the page's <h1> too would make Pandoc
+    # split each article into two chapters (duplicate TOC entries), and the page's
+    # heading often wraps an <a> to the original post — which is why TOC entries
+    # ended up pointing at external blog.sheerluck.dev URLs.
+    for h1 in best.find_all("h1"):
+        h1.decompose()
+
+    # Headings that wrap a link confuse Pandoc's TOC (it targets the link instead
+    # of an in-document anchor). Replace any link inside a heading with its text.
+    for heading in best.find_all(["h2", "h3", "h4", "h5", "h6"]):
+        for a in heading.find_all("a"):
+            a.replace_with(a.get_text())
 
     body_html = str(best)
     return title, body_html
@@ -201,6 +287,7 @@ def build_pandoc_epub(chapter_files: List[Path], output_epub: Path, title: str, 
     cmd = [
         "pandoc",
         "--toc",
+        "--epub-chapter-level=1",
         "--standalone",
         "--metadata", f"title={title}",
         "--metadata", f"lang={language}",
