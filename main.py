@@ -39,7 +39,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import List, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -186,7 +186,10 @@ def looks_like_toc(tag, source_host: str | None = None) -> bool:
     return False
 
 
-def extract_main_content(html_text: str, url: str) -> Tuple[str, str]:
+VIDEO_EXTENSIONS = (".mp4", ".webm", ".mov", ".m4v", ".ogv")
+
+
+def extract_main_content(html_text: str, url: str, idx: int) -> Tuple[str, str]:
     soup = BeautifulSoup(html_text, "html.parser")
     title = extract_title(soup, url)
 
@@ -249,6 +252,44 @@ def extract_main_content(html_text: str, url: str) -> Tuple[str, str]:
         for a in heading.find_all("a"):
             a.replace_with(a.get_text())
 
+    # Rewrite media references. Source pages use root-relative srcs like
+    # "/images/foo.png" that Pandoc resolves against the CWD and fails to fetch.
+    # Make them absolute so Pandoc downloads and embeds them. Video stills are
+    # served as <img src="….mp4">, which EPUB readers can't play, so replace
+    # those with a plain link to the video instead of an unfetchable resource.
+    for img in best.find_all("img"):
+        src = (img.get("src") or "").strip()
+        if not src:
+            img.decompose()
+            continue
+        abs_src = urljoin(url, src)
+        if abs_src.lower().split("?")[0].endswith(VIDEO_EXTENSIONS):
+            link = soup.new_tag("a", href=abs_src)
+            link.string = img.get("alt") or "Video"
+            para = soup.new_tag("p")
+            para.append(link)
+            img.replace_with(para)
+        else:
+            img["src"] = abs_src
+            if img.has_attr("srcset"):
+                del img["srcset"]
+
+    # Make heading/anchor identifiers globally unique. Pandoc concatenates every
+    # chapter into one document and honours explicit ids, so headings that share
+    # an id across chapters (e.g. "conclusion", "project-setup") collide. Prefix
+    # each chapter's ids and remap intra-chapter "#id" links to match.
+    id_prefix = f"ch{idx:03d}-"
+    id_map = {}
+    for tag in best.find_all(id=True):
+        old_id = tag["id"]
+        new_id = id_prefix + old_id
+        tag["id"] = new_id
+        id_map[old_id] = new_id
+    for a in best.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith("#") and href[1:] in id_map:
+            a["href"] = "#" + id_map[href[1:]]
+
     body_html = str(best)
     return title, body_html
 
@@ -287,7 +328,7 @@ def build_pandoc_epub(chapter_files: List[Path], output_epub: Path, title: str, 
     cmd = [
         "pandoc",
         "--toc",
-        "--epub-chapter-level=1",
+        "--split-level=1",
         "--standalone",
         "--metadata", f"title={title}",
         "--metadata", f"lang={language}",
@@ -447,7 +488,7 @@ def main() -> int:
                 progress.update(task, description=f"[cyan]{idx}/{len(links)}[/cyan] {urlparse(url).netloc}")
                 try:
                     raw_html = fetch_html(url)
-                    chapter_title, body_html = extract_main_content(raw_html, url)
+                    chapter_title, body_html = extract_main_content(raw_html, url, idx)
                     chapter_name = f"{idx:03d}-{slugify(chapter_title)}.xhtml"
                     chapter_path = workdir / chapter_name
                     chapter_path.write_text(
